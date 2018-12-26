@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates the Task Definition, ECS Service, and Service
+  Role required for the Fargate task. Pre-requisites - VPC, Subnet, ECS Service Role,
+  SQS Queue and S3 notification, S3 buckets
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC into which this cluster will be created
+  FargateSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: The subnet into which Fargate tasks will be created
+  ECSClusterName:
+    Type: String
+    Default: ECS-Pipeline-Cluster
+    Description: The name of the ECS/Fargate cluster in which the tasks will run
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: The name of the security group to be attached to the Fargate tasks
+  UnprocessedBucketParam:
+    Type: String
+    Description: Name of the Bucket for unprocessed data (source)
+  ProcessedBucketParam:
+    Type: String
+    Description: Name of the Bucket for processed data (destination)
+  ImageName:
+    Type: String
+    Description: Name assigned to the ECR repository
+    Default: ecs-pipeline
+  ECSServiceName:
+    Type: String
+    Default: ECS-Pipeline-Service
+    Description: The name of the fargate service to be created.
+  TaskCPU:
+    Type: Number
+    Default: 1024
+    Description: Set the Task's CPUs
+  TaskMemory:
+    Type: Number
+    Default: 4096
+    Description: Set the Task's Memory
+  LogGroup:
+    Type: String
+    Default: /ecs/PipelineTasks-Group
+    Description: Tasks will log messages to this CloudWatch group
+  ECSTaskContainerName:
+    Type: String
+    Default: ecs-pipeline-container
+    Description: ECS Task Container Name
+  SQSQueueName:
+    Description: Name of SQS Queue of event notifications from S3
+    Type: String
+    Default: incomingqueue
+Resources:
+  ECSTaskRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - lambda:*
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Effect: Allow
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${ProcessedBucketParam}
+                    - ProcessedBucketParam: !Ref 'ProcessedBucketParam'
+                  - !Sub
+                    - arn:aws:s3:::${ProcessedBucketParam}/*
+                    - ProcessedBucketParam: !Ref 'ProcessedBucketParam'
+              - Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Effect: Allow
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${UnprocessedBucketParam}
+                    - UnprocessedBucketParam: !Ref 'UnprocessedBucketParam'
+                  - !Sub
+                    - arn:aws:s3:::${UnprocessedBucketParam}/*
+                    - UnprocessedBucketParam: !Ref 'UnprocessedBucketParam'
+              - Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Effect: Allow
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${SQSQueueName}
+              - Action:
+                  - ssm:GetParameters
+                  - ssm:DescribeParameters
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*
+            Version: '2012-10-17'
+          PolicyName: ECS-Pipeline-Task-Role
+      RoleName: ecs-pipeline-task-role
+    Type: AWS::IAM::Role
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref 'ECSClusterName'
+  ECRContainerRepo:
+    Type: AWS::ECR::Repository
+    DependsOn: ECSTaskRole
+    Properties:
+      RepositoryName: !Ref 'ImageName'
+      RepositoryPolicyText:
+        Version: '2008-10-17'
+        Statement:
+          - Sid: AllowPushPull
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/ecs-pipeline-task-role
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+  PipelineTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: ECSTaskRole
+    Properties:
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/ecs-pipeline-task-role
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/ecs-pipeline-task-role
+      NetworkMode: awsvpc
+      Cpu: !Ref 'TaskCPU'
+      Memory: !Ref 'TaskMemory'
+      ContainerDefinitions:
+        - Name: !Ref 'ECSTaskContainerName'
+          Cpu: !Ref 'TaskCPU'
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageName}:latest
+          Essential: 'true'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: ecs
+  ECSPipelineService:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      Cluster: !Ref 'ECSCluster'
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 0
+      TaskDefinition: !Ref 'PipelineTaskDefinition'
+      ServiceName: !Ref 'ECSServiceName'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref 'FargateContainerSecurityGroup'
+          Subnets:
+            - !Ref 'FargateSubnet'
+  ECSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/PipelineTasks-Group
+      RetentionInDays: '30'
+  ECSTaskContainerNameSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_ECS_TASK_CONTAINER
+      Type: String
+      Value: !Ref 'ECSTaskContainerName'
+    Type: AWS::SSM::Parameter
+  ECSTaskDefinitionSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_ECS_TASK_DEFINITON
+      Type: String
+      Value: !Ref 'PipelineTaskDefinition'
+    Type: AWS::SSM::Parameter
+  ECSTaskSubnetSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_ECS_TASK_SUBNET
+      Type: String
+      Value: !Ref 'FargateSubnet'
+    Type: AWS::SSM::Parameter
+  ECSClusterSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_ECS_CLUSTER
+      Type: String
+      Value: !Ref 'ECSClusterName'
+    Type: AWS::SSM::Parameter
+  ECSTaskSGSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_ECS_TASK_SECURITYGROUP
+      Type: String
+      Value: !Ref 'FargateContainerSecurityGroup'
+    Type: AWS::SSM::Parameter
+  SQSUnprocessedURLSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_UNPROCESSED_SQS_URL
+      Type: String
+      Value: !Sub https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${SQSQueueName}
+    Type: AWS::SSM::Parameter
+  PipelineS3DestPrefixSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_S3_DEST_PREFIX
+      Type: String
+      Value: "processed"
+    Type: AWS::SSM::Parameter
+  PipelineS3DestBucketSSMParam:
+    Properties:
+      Description: Do NOT update. Updated from CFN
+      Name: PIPELINE_S3_DEST_BUCKET
+      Type: String
+      Value: !Ref 'ProcessedBucketParam'
+    Type: AWS::SSM::Parameter
+  PipelineEnabledSSMParam:
+    Properties:
+      Description: Enable or Disable the ECS Pipeline Tasks
+      Name: PIPELINE_ENABLED
+      Type: String
+      Value: 1
+    Type: AWS::SSM::Parameter
+  PipelineMaxTasksSSMParam:
+    Properties:
+      Description: Set the Max number of ECS tasks for the Lambda autoscaling function
+      Name: PIPELINE_ECS_MAX_TASKS
+      Type: String
+      Value: 10
+    Type: AWS::SSM::Parameter
+
+
