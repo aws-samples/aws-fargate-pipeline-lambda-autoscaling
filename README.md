@@ -26,7 +26,7 @@ All configuration for the service is stored in SSM Parameters.
 
 * Create a SQS queue and attach a policy to the queue which allows the Source Bucket ARN to publish event notifications to the Queue.
 
-In this example, the bucked called `my-source-s3-bucket` is allowed to SendMessage to the SQS queue called `incomingqueue`. Attach the resource policy to the SQS queue. This can be done via the Console or the CLI.
+In this example, the bucket called `my-source-s3-bucket` is allowed to SendMessage to the SQS queue called `incomingqueue`. Attach the resource policy to the SQS queue. This can be done via the Console or the CLI.
 
 ```
 {
